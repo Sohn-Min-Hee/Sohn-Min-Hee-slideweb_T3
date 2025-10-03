@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>ESP32 Potentiometer MiniGame</title>
+<style>
+  body { margin:0; background:black; color:white; overflow:hidden; }
+  .stage { position:relative; width:100vw; height:100vh; }
+  .videoLayer {
+    position:absolute; inset:0;
+    width:100%; height:100%;
+    object-fit:cover;
+    background:black;          /* 빈 프레임 보정 */
+    display:none;               /* 한 번에 하나만 보이게 */
+  }
+  .videoLayer.show { display:block; }
+  #pairBtn {
+    position:absolute; top:10px; left:50%; transform:translateX(-50%);
+    padding:10px 20px; font-size:18px; z-index:10;
+  }
+  #gameUI {
+    position:absolute; left:50%; bottom:50px; transform:translateX(-50%);
+    width:80%; height:30px; background:#333; border-radius:15px;
+    overflow:hidden; display:none; z-index:8;
+  }
+  #gauge { height:100%; width:0%; background:lime; transition:none; }
+  #target { position:absolute; top:0; width:4px; height:100%; background:red; }
+  #status {
+    position:absolute; left:50%; bottom:100px; transform:translateX(-50%);
+    font-size:24px; display:none; z-index:9;
+  }
+  /* 클릭 안내(선택) */
+  #tapHint {
+    position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+    font-size:22px; color:#ddd; z-index:7; user-select:none;
+  }
+</style>
+</head>
+<body>
+
+<div class="stage" id="stage">
+  <button id="pairBtn">페어링</button>
+
+  <div id="gameUI">
+    <div id="gauge"></div>
+    <div id="target"></div>
+  </div>
+  <div id="status"></div>
+  <div id="tapHint">화면을 클릭하면 시작합니다</div>
+
+  <!-- 비디오 5개를 겹쳐두고 전환만 함 (블랙 로딩 방지) -->
+  <video id="vA" class="videoLayer show" src="videoA.mp4" muted loop playsinline preload="auto"></video>
+  <video id="vB" class="videoLayer"        src="videoB.mp4" muted      playsinline preload="auto"></video>
+  <video id="vC" class="videoLayer"        src="videoC.mp4" muted      playsinline preload="auto"></video>
+  <video id="vD" class="videoLayer"        src="videoD.mp4" muted      playsinline preload="auto"></video>
+  <video id="vE" class="videoLayer"        src="videoE.mp4" muted      playsinline preload="auto"></video>
+</div>
+
+<script>
+/* ===== 상태 변수 ===== */
+let characteristic;
+let potValue = 0;          // 0~4095 (ESP32 12bit 가정)
+let gameActive = false;    // 미니게임(C) 활성 여부
+let targetValue = 0;       // 목표 포인트(0~4095)
+let gameTimer = null;      // 3초 타이머
+let current = 'A';         // 현재 재생 중인 비디오 키
+
+/* ===== 엘리먼트 ===== */
+const stage = document.getElementById('stage');
+const gameUI = document.getElementById('gameUI');
+const gauge  = document.getElementById('gauge');
+const target = document.getElementById('target');
+const statusBox = document.getElementById('status');
+const pairBtn = document.getElementById('pairBtn');
+const tapHint = document.getElementById('tapHint');
+
+const videos = {
+  A: document.getElementById('vA'),
+  B: document.getElementById('vB'),
+  C: document.getElementById('vC'),
+  D: document.getElementById('vD'),
+  E: document.getElementById('vE'),
+};
+
+/* ===== 공통 함수 ===== */
+function showVideo(key, {loop=false, fromStart=true} = {}) {
+  // 모두 숨기고 대상만 show
+  Object.entries(videos).forEach(([k, vid]) => {
+    if (k === key) {
+      vid.classList.add('show');
+    } else {
+      vid.classList.remove('show');
+      vid.pause();
+    }
+  });
+
+  const v = videos[key];
+  v.loop = loop;
+  if (fromStart) {
+    try { v.currentTime = 0; } catch(_) {}
+  }
+  v.play().catch(()=>{});  // 자동재생 보장(음소거)
+  current = key;
+}
+
+function showGauge(visible) {
+  gameUI.style.display = visible ? 'block' : 'none';
+}
+
+function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
+
+/* ===== BLE 연결 (기존에 잘 되던 방식 유지) ===== */
+async function connectBLE() {
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: "ESP32-Pot" }],
+      optionalServices: ["4fafc201-1fb5-459e-8fcc-c5c9c331914b"]
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+    characteristic = await service.getCharacteristic("beb5483e-36e1-4688-b7f5-ea07361b26a8");
+
+    await characteristic.startNotifications();
+    characteristic.addEventListener("characteristicvaluechanged", handlePotValue);
+
+    console.log("✅ BLE Connected");
+  } catch (err) {
+    console.error("❌ BLE Error:", err);
+  }
+}
+
+/* ===== 포텐셔미터 수신 ===== */
+function handlePotValue(event) {
+  const dv = event.target.value; // DataView
+  let val = 0;
+  try {
+    // 2바이트가 오면 12bit 값(0~4095)로 파싱, 1바이트면 0~255 스케일로 업스케일
+    if (dv.byteLength >= 2) val = dv.getUint16(0, true);
+    else                    val = dv.getUint8(0) * 16; // 0~255 -> 0~4080
+  } catch (_) {
+    // 혹시 브라우저/스택 이슈 시 안전 처리
+    val = 0;
+  }
+  potValue = clamp(val, 0, 4095);
+
+  // C에서만 게이지 반영
+  if (gameActive && current === 'C') {
+    const percent = (potValue / 4095) * 100;
+    gauge.style.width = percent + "%";
+  }
+}
+
+/* ===== 흐름 컨트롤 ===== */
+function startSequence() {
+  tapHint.style.display = 'none';
+  statusBox.style.display = 'none';
+  showGauge(false);
+
+  // B 재생 후 끝나면 C
+  showVideo('B', {loop:false});
+}
+
+function startMiniGameOnC() {
+  // C 시작과 함께 미니게임 시작
+  gameActive = true;
+  showGauge(true);
+  statusBox.style.display = 'none';
+
+  // 목표 설정 & 위치 표시
+  targetValue = Math.floor(Math.random() * 4095);
+  const tPercent = (targetValue / 4095) * 100;
+  target.style.left = tPercent + "%";
+
+  // 3초 후 판정
+  clearTimeout(gameTimer);
+  gameTimer = setTimeout(() => {
+    // C 재생 중일 때만 판정(혹시 이미 넘어갔으면 무시)
+    if (current === 'C') endGame();
+  }, 3000);
+}
+
+function endGame() {
+  gameActive = false;
+
+  // C에서 벗어날 것이므로 게이지 즉시 숨김
+  showGauge(false);
+
+  const diff = Math.abs(potValue - targetValue);
+  if (diff < 100) {
+    statusBox.textContent = "🎉 성공!";
+    showVideo('D', {loop:false});
+  } else {
+    statusBox.textContent = "❌ 실패!";
+    showVideo('E', {loop:false});
+  }
+  statusBox.style.display = 'block';
+}
+
+function resetToA() {
+  statusBox.style.display = 'none';
+  showGauge(false);
+  showVideo('A', {loop:true});
+}
+
+/* ===== 이벤트 바인딩 ===== */
+// 비디오 체인: B 끝 → C 시작(+미니게임), C 끝 → (아직 판정 안 했으면) 판정
+videos.B.addEventListener('ended', () => {
+  showVideo('C', {loop:false});
+  startMiniGameOnC();
+});
+
+videos.C.addEventListener('ended', () => {
+  // 안전장치: C가 3초보다 짧아 끝났는데 아직 판정 안 했으면 판정
+  if (gameActive) endGame();
+});
+
+videos.D.addEventListener('ended', resetToA);
+videos.E.addEventListener('ended', resetToA);
+
+// 아무 영상이나 클릭하면 시퀀스 시작
+Object.values(videos).forEach(v => v.addEventListener('click', startSequence));
+
+// 페어링 버튼
+pairBtn.addEventListener('click', connectBLE);
+
+/* ===== 초기 준비 ===== */
+// 미리 로드 (블랙로딩 최소화)
+Object.values(videos).forEach(v => { try { v.load(); } catch(_) {} });
+showVideo('A', {loop:true});
+</script>
+</body>
+</html>
